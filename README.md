@@ -41,6 +41,17 @@
 - Python 3.8+
 - Environnement de bureau avec session graphique (Cinnamon, MATE, XFCE…)
 
+### Support GPU
+
+| Vendor | Statut | Outil requis |
+|--------|--------|--------------|
+| **NVIDIA** | ✅ Complet — charge, température, VRAM, ECC, PCIe, CUDA… | `nvidia-smi` |
+| **AMD** | ⚠️ Basique — charge et température uniquement | `rocm-smi` |
+| **Intel Arc** | ❌ Non supporté | — |
+
+> **Note AMD** : le code détecte `rocm-smi` mais le popup de détail VRAM 
+> n'a pas pu être validé faute de matériel. Les contributions sont les bienvenues !
+
 ### Paquets (installés automatiquement par `install.sh`)
 ```
 python3-gi python3-gi-cairo gir1.2-gtk-3.0
