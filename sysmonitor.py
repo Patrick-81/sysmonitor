@@ -1400,7 +1400,7 @@ class SysMonitor(Gtk.Window):
                     "{} / {}".format(d["pcie_gen"], d.get("pcie_width","?"))))
         if not d or (not d.get("type") and not d.get("fb_total")):
             lines += [v("Données non disponibles", WARN),
-                      v("(nvidia-smi -q requis)", TEXT_DIM)]
+                      v("(nvidia-smi  ou rocm-msi non disponibles)", TEXT_DIM)]
         lines.append("</span>")
         self._popup = DetailPopup("▦ VRAM — DÉTAILS", "\n".join(lines), self)
 
