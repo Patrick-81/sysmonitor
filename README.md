@@ -1,0 +1,255 @@
+# ◈ SysMonitor
+
+> Widget de bureau semi-transparent pour **Linux Mint** (et distributions Debian/Ubuntu).  
+> Affichage temps réel de CPU, GPU, VRAM, RAM, stockage et réseau — mis à jour toutes les secondes.
+
+![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)
+![GTK](https://img.shields.io/badge/GTK-3.0-4A86CF?logo=gnome&logoColor=white)
+![Linux](https://img.shields.io/badge/Linux-Mint%20%2F%20Ubuntu%20%2F%20Debian-87CF3E?logo=linux&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green)
+
+---
+
+## Fonctionnalités
+
+| Section | Informations affichées | Clic |
+|---------|------------------------|------|
+| **CPU** | Charge %, température, fréquence | Modèle, cœurs physiques/logiques, charge par cœur, températures par capteur |
+| **GPU** | Charge %, température | Modèle, vendor, pilote, horloge |
+| **VRAM** | % utilisé, Mo utilisé / total | Type GDDR, taille, BAR1, horloge mémoire, bus, ECC, PCIe, CUDA |
+| **RAM** | % utilisé, Mo utilisé / total, swap | Barrettes physiques : type DDR, capacité, fréquence, **CAS Latency**, fabricant, référence, tension |
+| **Stockage** | Total utilisé / total physique | Disques physiques : NVMe/SSD/HDD, modèle, partitions, température |
+| **Réseau** | ↓ DL / ↑ UL en temps réel, cumuls session + boot | Débit par interface, totaux, paquets, erreurs |
+
+### Autres fonctionnalités
+
+- **Sparklines** — graphes d'historique 60 secondes pour CPU, GPU et réseau (double courbe ↓/↑)
+- **4 thèmes couleur** — Vert menthe, Bleu azur, Ambre doré, Violet néon
+- **Semi-transparent** — fond sombre avec alpha configurable, bordure lumineuse
+- **Icône système** — AppIndicator3, masquer/afficher d'un clic
+- **Bouton `—`** — réduire dans la barre de notification
+- **Menu clic droit** — Réduire / Thème / Redémarrer / À propos / Quitter
+- **Position mémorisée** — sauvegardée dans `~/.config/sysmonitor/config.ini`
+- **Service systemd** — démarrage automatique avec la session, redémarrage en cas de crash
+
+---
+
+## Prérequis
+
+### Système
+- Linux Mint 20+ / Ubuntu 20.04+ / Debian 11+
+- Python 3.8+
+- Environnement de bureau avec session graphique (Cinnamon, MATE, XFCE…)
+
+### Paquets (installés automatiquement par `install.sh`)
+```
+python3-gi python3-gi-cairo gir1.2-gtk-3.0
+gir1.2-ayatanaappindicator3-0.1
+python3-psutil
+dmidecode
+i2c-tools
+smartmontools
+```
+
+### Optionnel
+- `nvidia-smi` — pour les GPU NVIDIA
+- `rocm-smi` — pour les GPU AMD
+- `decode-dimms` — pour le CAS Latency exact depuis le SPD des barrettes RAM
+
+---
+
+## Installation
+
+### Installation automatique (recommandée)
+
+```bash
+git clone https://github.com/VOTRE_USERNAME/sysmonitor.git
+cd sysmonitor
+bash install.sh
+systemctl --user start sysmonitor
+```
+
+Le script `install.sh` prend en charge automatiquement :
+1. Installation des dépendances APT
+2. Installation de `psutil` via pip
+3. Installation et configuration de `decode-dimms`
+4. Création des règles **sudoers** (sans mot de passe) pour `dmidecode`, `smartctl` et `decode-dimms`
+5. Création et activation du **service systemd** utilisateur
+6. Entrée **Autostart** pour le gestionnaire de session
+
+### Installation manuelle
+
+```bash
+# 1. Dépendances
+sudo apt-get install python3-gi python3-gi-cairo gir1.2-gtk-3.0 \
+    gir1.2-ayatanaappindicator3-0.1 dmidecode smartmontools i2c-tools
+pip3 install psutil --break-system-packages
+
+# 2. decode-dimms (CAS Latency exact)
+sudo cp /usr/share/doc/i2c-tools/examples/decode-dimms /usr/local/bin/
+sudo chmod +x /usr/local/bin/decode-dimms
+
+# 3. Sudoers (pour dmidecode, smartctl, decode-dimms sans mot de passe)
+sudo visudo -f /etc/sudoers.d/sysmonitor
+# Ajoutez :
+# votreuser ALL=(ALL) NOPASSWD: /usr/sbin/dmidecode
+# votreuser ALL=(ALL) NOPASSWD: /usr/sbin/smartctl
+# votreuser ALL=(ALL) NOPASSWD: /usr/local/bin/decode-dimms
+
+# 4. Lancement
+python3 sysmonitor.py &
+```
+
+---
+
+## Utilisation
+
+### Contrôles
+
+| Action | Effet |
+|--------|-------|
+| **Bouton `—`** (barre de titre) | Réduire le widget dans la barre de notification |
+| **Icône dans la barre de notification** | Afficher / Masquer le widget |
+| **Clic gauche + glisser** | Déplacer le widget (position sauvegardée automatiquement) |
+| **Clic droit** | Ouvrir le menu contextuel |
+| **Clic sur CPU** | Popup : détails processeur, charge par cœur, températures |
+| **Clic sur GPU** | Popup : détails GPU, pilote |
+| **Clic sur VRAM** | Popup : type mémoire, bus, ECC, PCIe, CUDA |
+| **Clic sur RAM** | Popup : barrettes physiques, CAS Latency, fréquence, fabricant |
+| **Clic sur RÉSEAU** | Popup : détails par interface, cumuls |
+
+### Menu clic droit
+
+- **Réduire** — masque le widget (récupérable via l'icône système)
+- **Thème couleur** — 4 thèmes disponibles, changement immédiat et sauvegardé
+- **Redémarrer** — relance le processus (utile après une mise à jour)
+- **À propos** — version et raccourcis
+- **Quitter** — ferme le widget
+
+---
+
+## Configuration
+
+Fichier : `~/.config/sysmonitor/config.ini`
+
+```ini
+[sysmonitor]
+theme = green    # green | blue | amber | purple
+x = 1580         # position horizontale (px)
+y = 40           # position verticale (px)
+```
+
+La position est mise à jour automatiquement après chaque déplacement.
+
+---
+
+## Gestion du service
+
+```bash
+# Démarrer
+systemctl --user start sysmonitor
+
+# Arrêter
+systemctl --user stop sysmonitor
+
+# Redémarrer
+systemctl --user restart sysmonitor
+
+# État
+systemctl --user status sysmonitor
+
+# Logs en direct
+journalctl --user -u sysmonitor -f
+
+# Désactiver le démarrage automatique
+systemctl --user disable sysmonitor
+```
+
+---
+
+## Notes techniques
+
+### CAS Latency (RAM)
+
+`decode-dimms` lit les puces **SPD (Serial Presence Detect)** des barrettes via le bus i²C :
+
+- **DDR3** — CL exact généralement disponible ✓
+- **DDR4 / DDR5** — l'accès i²C est souvent bloqué par le firmware UEFI pour des raisons de sécurité. Dans ce cas, le CL est **estimé** à partir de la fréquence (dmidecode) et affiché en orange avec la mention *(estimé)*.
+
+### Températures disques
+
+`smartctl` interroge les attributs S.M.A.R.T. de chaque disque physique. Les températures sont rafraîchies toutes les **30 secondes** en arrière-plan pour ne pas bloquer l'interface.
+
+### Réseau
+
+- **Débit instantané** — delta des compteurs `psutil.net_io_counters()` sur 1 seconde
+- **Cumul session** — accumulé depuis le lancement du widget
+- **Cumul boot** — total système depuis le démarrage via les compteurs `psutil`
+- Loopback (`lo`) et interfaces sans trafic ignorées automatiquement
+
+### Thèmes
+
+Les couleurs du thème actif (ACCENT, ACCENT2, ACCENT3) sont des variables globales réaffectées à la volée. Toutes les barres et sparklines se mettent à jour au prochain tick (1 s).
+
+---
+
+## Structure du projet
+
+```
+sysmonitor/
+├── sysmonitor.py      # Application principale (GTK3, ~1660 lignes)
+├── install.sh         # Script d'installation automatique
+└── README.md          # Cette documentation
+```
+
+---
+
+## Dépannage
+
+**Le widget n'apparaît pas**
+```bash
+python3 sysmonitor.py   # lancer en console pour voir les erreurs
+```
+
+**AppIndicator3 non disponible**
+```bash
+sudo apt-get install gir1.2-ayatanaappindicator3-0.1
+# ou pour les anciens systèmes :
+sudo apt-get install gir1.2-appindicator3-0.1
+```
+
+**Températures CPU absentes**
+```bash
+sudo apt-get install lm-sensors
+sudo sensors-detect --auto
+```
+
+**dmidecode ne retourne rien (RAM)**
+```bash
+# Vérifier que la règle sudoers est correcte
+sudo -n dmidecode -t memory | head -20
+```
+
+**Le service ne démarre pas avec la session**
+```bash
+# Vérifier que systemd user est actif
+systemctl --user status
+# Vérifier la variable DISPLAY
+echo $DISPLAY   # doit retourner :0 ou :1
+```
+
+---
+
+## Licence
+
+MIT — libre d'utilisation, modification et redistribution.
+
+---
+
+## Contributions
+
+Les PR sont les bienvenues ! En particulier :
+- Support des GPU Intel Arc (`intel_gpu_top`)
+- Support `sensors` pour températures supplémentaires  
+- Portage Wayland (actuellement X11 uniquement via GTK3)
+- Tests sur d'autres distributions (Fedora, Arch…)
