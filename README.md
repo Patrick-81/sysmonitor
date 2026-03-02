@@ -3,10 +3,10 @@
 > Widget de bureau semi-transparent pour **Linux Mint** (et distributions Debian/Ubuntu).  
 > Affichage temps réel de CPU, GPU, VRAM, RAM, stockage et réseau — mis à jour toutes les secondes.
 
-![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)
-![GTK](https://img.shields.io/badge/GTK-3.0-4A86CF?logo=gnome&logoColor=white)
-![Linux](https://img.shields.io/badge/Linux-Mint%20%2F%20Ubuntu%20%2F%20Debian-87CF3E?logo=linux&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-green)
+![Python](https://img.shields.io/Patrick-81/Python-3.8%2B-3776AB?logo=python&logoColor=white)
+![GTK](https://img.shields.io/Patrick-81/GTK-3.0-4A86CF?logo=gnome&logoColor=white)
+![Linux](https://img.shields.io/Patrick-81/Linux-Mint%20%2F%20Ubuntu%20%2F%20Debian-87CF3E?logo=linux&logoColor=white)
+![License](https://img.shields.io/Patrick-81/License-MIT-green)
 
 ---
 
