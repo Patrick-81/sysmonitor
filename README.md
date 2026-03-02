@@ -3,10 +3,10 @@
 > Widget de bureau semi-transparent pour **Linux Mint** (et distributions Debian/Ubuntu).  
 > Affichage temps réel de CPU, GPU, VRAM, RAM, stockage et réseau — mis à jour toutes les secondes.
 
-![Python](https://img.shields.io/Patrick-81/Python-3.8%2B-3776AB?logo=python&logoColor=white)
-![GTK](https://img.shields.io/Patrick-81/GTK-3.0-4A86CF?logo=gnome&logoColor=white)
-![Linux](https://img.shields.io/Patrick-81/Linux-Mint%20%2F%20Ubuntu%20%2F%20Debian-87CF3E?logo=linux&logoColor=white)
-![License](https://img.shields.io/Patrick-81/License-MIT-green)
+![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)
+![GTK](https://img.shields.io/badge/GTK-3.0-4A86CF?logo=gnome&logoColor=white)
+![Linux](https://img.shields.io/badge/Linux-Mint%20%2F%20Ubuntu%20%2F%20Debian-87CF3E?logo=linux&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green)
 
 ---
 
@@ -40,6 +40,17 @@
 - Linux Mint 20+ / Ubuntu 20.04+ / Debian 11+
 - Python 3.8+
 - Environnement de bureau avec session graphique (Cinnamon, MATE, XFCE…)
+
+### Support GPU
+
+| Vendor | Statut | Outil requis |
+|--------|--------|--------------|
+| **NVIDIA** | ✅ Complet — charge, température, VRAM, ECC, PCIe, CUDA… | `nvidia-smi` |
+| **AMD** | ⚠️ Basique — charge et température uniquement | `rocm-smi` |
+| **Intel Arc** | ❌ Non supporté | — |
+
+> **Note AMD** : le code détecte `rocm-smi` mais le popup de détail VRAM 
+> n'a pas pu être validé faute de matériel. Les contributions sont les bienvenues !
 
 ### Paquets (installés automatiquement par `install.sh`)
 ```
