@@ -87,9 +87,19 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.ini")
 def load_config():
     cfg = configparser.ConfigParser()
     cfg["sysmonitor"] = {"theme": "green", "x": "-1", "y": "-1"}
+    cfg["collapsed"]  = {}   # section title → "1" si replié
     if os.path.exists(CONFIG_FILE):
         cfg.read(CONFIG_FILE)
     return cfg
+
+def is_collapsed(cfg, title):
+    return cfg.get("collapsed", title.upper(), fallback="0") == "1"
+
+def set_collapsed(cfg, title, state):
+    if "collapsed" not in cfg:
+        cfg["collapsed"] = {}
+    cfg["collapsed"][title.upper()] = "1" if state else "0"
+    save_config(cfg)
 
 def save_config(cfg):
     os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -186,6 +196,109 @@ def get_net_info(prev_counters=None, interval=1.0):
     interfaces.sort(key=lambda x: x["rx_bps"] + x["tx_bps"], reverse=True)
     return {"interfaces": interfaces, "total_rx_bps": total_rx,
             "total_tx_bps": total_tx, "counters": current}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  COLLECTEURS SMART & PROCESSUS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Attributs SMART critiques surveillés
+_SMART_CRITICAL = {
+    "5":   "Reallocated sectors",
+    "187": "Uncorrectable errors",
+    "188": "Command timeout",
+    "196": "Reallocation events",
+    "197": "Pending sectors",
+    "198": "Offline uncorrectable",
+}
+
+def get_smart_health():
+    """
+    Retourne un dict par disque : {"disk": "/dev/sda", "status": "OK"|"WARN"|"CRIT",
+                                    "attrs": [...], "overall": "PASSED"|"FAILED"|"N/A"}
+    Utilise smartctl -A et -H. Nécessite sudo -n ou être dans le groupe disk.
+    """
+    results = []
+    # Lister les disques block
+    try:
+        import glob
+        disks = sorted(
+            [d for d in glob.glob("/dev/sd?") + glob.glob("/dev/nvme?n?")]
+        )
+    except Exception:
+        return results
+
+    for disk in disks:
+        entry = {"disk": disk, "status": "OK", "overall": "N/A", "attrs": [], "error": None}
+
+        # Test de santé global (-H)
+        out_h = _run(["sudo", "-n", "smartctl", "-H", disk], timeout=5)
+        if not out_h:
+            out_h = _run(["smartctl", "-H", disk], timeout=5)
+        if "PASSED" in out_h:
+            entry["overall"] = "PASSED"
+        elif "FAILED" in out_h:
+            entry["overall"] = "FAILED"
+            entry["status"]  = "CRIT"
+
+        # Attributs détaillés (-A)
+        out_a = _run(["sudo", "-n", "smartctl", "-A", disk], timeout=5)
+        if not out_a:
+            out_a = _run(["smartctl", "-A", disk], timeout=5)
+
+        for line in out_a.splitlines():
+            parts = line.split()
+            if len(parts) < 10:
+                continue
+            attr_id = parts[0]
+            if attr_id not in _SMART_CRITICAL:
+                continue
+            try:
+                raw_val = int(parts[-1].split("+")[0])  # valeur RAW_VALUE
+            except ValueError:
+                continue
+            label = _SMART_CRITICAL[attr_id]
+            entry["attrs"].append({"id": attr_id, "label": label, "raw": raw_val})
+            if raw_val > 0 and entry["status"] != "CRIT":
+                entry["status"] = "WARN"
+            if raw_val > 10:
+                entry["status"] = "CRIT"
+
+        # Si smartctl non dispo ou disque NVMe sans sortie, laisser N/A
+        if not out_h and not out_a:
+            entry["status"]  = "N/A"
+            entry["overall"] = "N/A"
+            entry["error"]   = "smartctl indisponible"
+
+        results.append(entry)
+
+    return results
+
+
+# Seuils pour les processus suspects
+_PROC_CPU_WARN = 50.0   # % CPU mono-cœur au-delà duquel c'est suspect
+_PROC_CPU_CRIT = 90.0
+_TOP_N_PROCS   = 5      # nombre de processus à afficher
+
+def get_top_cpu_procs():
+    """
+    Retourne les N processus les plus gourmands en CPU.
+    Chaque entrée : {"pid", "name", "cpu", "status"}
+    """
+    procs = []
+    for p in psutil.process_iter(["pid", "name", "cpu_percent", "status"]):
+        try:
+            cpu = p.info["cpu_percent"] or 0.0
+            procs.append({
+                "pid":    p.info["pid"],
+                "name":   (p.info["name"] or "?")[:22],
+                "cpu":    cpu,
+                "status": p.info["status"],
+            })
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    procs.sort(key=lambda x: x["cpu"], reverse=True)
+    return procs[:_TOP_N_PROCS]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -761,38 +874,204 @@ class DualSparkline(Gtk.DrawingArea):
         cr.move_to(w - 22, 9); cr.show_text("↑UL")
 
 
+# ── Barre compacte (mode replié) ──────────────────────────────────────────────
+
+class MiniBar(Gtk.DrawingArea):
+    """
+    Barre verticale compacte (~70 px) affichée quand le panneau est replié.
+    Chaque métrique occupe un bloc lisible : label + valeur + mini-barre.
+    Un clic dessus déplie le panneau complet.
+    """
+    WIDTH  = 70
+    PAD    = 6    # marge intérieure
+    FSIZE  = 8.5  # taille police label
+    FSIZE_VAL = 11 # taille police valeur
+
+    def __init__(self, hist_cpu, hist_rx, hist_tx):
+        super().__init__()
+        self._hist_cpu = hist_cpu
+        self._hist_rx  = hist_rx
+        self._hist_tx  = hist_tx
+        self._cpu_pct  = 0.0
+        self._ram_pct  = 0.0
+        self._rx_bps   = 0.0
+        self._tx_bps   = 0.0
+        self.set_size_request(self.WIDTH, 300)
+        self.connect("draw", self._draw)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+
+    def update(self, cpu, ram, rx, tx):
+        self._cpu_pct = cpu
+        self._ram_pct = ram
+        self._rx_bps  = rx
+        self._tx_bps  = tx
+        self.queue_draw()
+
+    def _draw_metric(self, cr, w, y, label, value_str, pct, color):
+        """Dessine un bloc : label, valeur en grand, mini-barre de progression."""
+        p = self.PAD
+
+        # Label petit en haut
+        cr.set_source_rgba(*TEXT_DIM, 0.75)
+        cr.select_font_face("Monospace", 0, 0)
+        cr.set_font_size(self.FSIZE)
+        cr.move_to(p, y + 10)
+        cr.show_text(label)
+
+        # Valeur en plus grand
+        cr.set_source_rgba(*color, 1.0)
+        cr.select_font_face("Monospace", 0, 1)
+        cr.set_font_size(self.FSIZE_VAL)
+        cr.move_to(p, y + 23)
+        cr.show_text(value_str)
+
+        # Mini-barre horizontale
+        bar_y  = y + 27
+        bar_w  = w - p * 2
+        bar_h  = 4
+        fill_w = max(bar_h, bar_w * max(0.0, min(1.0, pct)))
+        cr.set_source_rgba(*BG_DARK, 0.8)
+        _rr(cr, p, bar_y, bar_w, bar_h, bar_h/2); cr.fill()
+        cr.set_source_rgba(*color, 0.85)
+        _rr(cr, p, bar_y, fill_w, bar_h, bar_h/2); cr.fill()
+
+        return y + 38   # retourne le y suivant
+
+    def _draw(self, widget, cr):
+        w = widget.get_allocated_width()
+        h = widget.get_allocated_height()
+
+        # Fond arrondi
+        cr.set_source_rgba(*BG_DARK, BG_ALPHA)
+        _rr(cr, 0, 0, w, h, 10); cr.fill()
+        cr.set_source_rgba(*ACCENT, 0.28); cr.set_line_width(1)
+        _rr(cr, 0, 0, w, h, 10); cr.stroke()
+
+        # Titre / indicateur d'expansion
+        cr.set_source_rgba(*ACCENT, 0.55)
+        cr.select_font_face("Monospace", 0, 1)
+        cr.set_font_size(9)
+        cr.move_to(self.PAD, 14)
+        cr.show_text("▶ SYS")
+
+        y = 22
+
+        # ── Métriques ────────────────────────────────────────────────────────
+        y = self._draw_metric(cr, w, y,
+            "CPU", "{:.0f}%".format(self._cpu_pct),
+            self._cpu_pct / 100, load_color(self._cpu_pct))
+
+        y = self._draw_metric(cr, w, y,
+            "RAM", "{:.0f}%".format(self._ram_pct),
+            self._ram_pct / 100, load_color(self._ram_pct))
+
+        rx_str = fmt_speed(self._rx_bps) if self._rx_bps > 100 else "— B/s"
+        tx_str = fmt_speed(self._tx_bps) if self._tx_bps > 100 else "— B/s"
+        # Normalisation réseau sur 100 MB/s max affiché
+        rx_pct = min(self._rx_bps / 100e6, 1.0)
+        tx_pct = min(self._tx_bps / 100e6, 1.0)
+        y = self._draw_metric(cr, w, y, "↓ DL", rx_str, rx_pct, ACCENT)
+        y = self._draw_metric(cr, w, y, "↑ UL", tx_str, tx_pct, ACCENT2)
+
+        # ── Sparkline CPU en bas ──────────────────────────────────────────────
+        vals = list(self._hist_cpu)
+        if len(vals) >= 2:
+            spark_h = 36
+            spark_y = h - spark_h - self.PAD - 14
+            p = self.PAD
+
+            # Label sparkline
+            cr.set_source_rgba(*TEXT_DIM, 0.5)
+            cr.select_font_face("Monospace", 0, 0)
+            cr.set_font_size(7)
+            cr.move_to(p, spark_y - 2)
+            cr.show_text("CPU 60s")
+
+            # Fond
+            cr.set_source_rgba(*BG_DARK, 0.5)
+            _rr(cr, p, spark_y, w - p*2, spark_h, 3); cr.fill()
+
+            step = (w - p*2) / (len(vals) - 1)
+            # Aire
+            cr.new_path()
+            cr.move_to(p, spark_y + spark_h)
+            for i, v in enumerate(vals):
+                cr.line_to(p + i * step, spark_y + spark_h - (v/100.0)*spark_h)
+            cr.line_to(p + (len(vals)-1)*step, spark_y + spark_h)
+            cr.close_path()
+            cr.set_source_rgba(*SPARK, 0.18); cr.fill()
+            # Ligne
+            cr.new_path()
+            for i, v in enumerate(vals):
+                x = p + i * step
+                yy = spark_y + spark_h - (v/100.0)*spark_h
+                if i == 0: cr.move_to(x, yy)
+                else:       cr.line_to(x, yy)
+            cr.set_source_rgba(*SPARK, 0.85)
+            cr.set_line_width(1.2); cr.stroke()
+
+        # Astuce clic en bas
+        cr.set_source_rgba(*TEXT_DIM, 0.4)
+        cr.select_font_face("Monospace", 0, 0)
+        cr.set_font_size(7)
+        cr.move_to(self.PAD, h - 4)
+        cr.show_text("clic → déplier")
+
+
 # ── Section cliquable ─────────────────────────────────────────────────────────
 
 class Section(Gtk.EventBox):
-    def __init__(self, icon, title, on_click=None, sparkline_history=None):
+    def __init__(self, icon, title, on_click=None, sparkline_history=None,
+                 collapsed=False):
         super().__init__()
-        self._on_click = on_click
+        self._on_click   = on_click
+        self._collapsed  = collapsed
+        self._title      = title
+        self._on_collapse_cb = None   # callback(title, collapsed) pour sauvegarder
 
-        if on_click:
-            self.connect("button-press-event", self._handle_press)
-            self.set_events(Gdk.EventMask.BUTTON_PRESS_MASK |
-                            Gdk.EventMask.ENTER_NOTIFY_MASK |
-                            Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        # Clic sur la section → popup détail (bouton gauche uniquement)
+        self.connect("button-press-event", self._handle_press)
+        self.set_events(Gdk.EventMask.BUTTON_PRESS_MASK |
+                        Gdk.EventMask.ENTER_NOTIFY_MASK |
+                        Gdk.EventMask.LEAVE_NOTIFY_MASK)
 
+        # ── Boîte racine ──────────────────────────────────────────────────────
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         box.set_margin_top(7); box.set_margin_bottom(7)
         box.set_margin_start(14); box.set_margin_end(14)
 
-        # En-tête
+        # ── En-tête (toujours visible) ────────────────────────────────────────
         hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
         li = Gtk.Label()
-        li.set_markup('<span font_desc="Monospace 10" foreground="{}">{}</span>'.format(hx(ACCENT), icon))
+        li.set_markup('<span font_desc="Monospace 10" foreground="{}">{}</span>'.format(
+            hx(ACCENT), icon))
+
         lt = Gtk.Label()
         lt.set_markup('<span font_desc="Monospace Bold 9" foreground="{}" '
                       'letter_spacing="2000">{}</span>'.format(hx(TEXT_DIM), title))
         lt.set_halign(Gtk.Align.START)
-        hbox.pack_start(li, False, False, 0)
-        hbox.pack_start(lt, False, False, 0)
+
+        # Bouton replier/déplier ▾ / ▸
+        self._btn_fold = Gtk.Button()
+        self._btn_fold.set_relief(Gtk.ReliefStyle.NONE)
+        self._btn_fold.set_size_request(18, 14)
+        self._btn_fold.get_style_context().add_class("flat")
+        self._btn_fold.connect("clicked", self._on_fold_clicked)
+        self._update_fold_label()
+
+        hbox.pack_start(li,             False, False, 0)
+        hbox.pack_start(lt,             False, False, 0)
+        hbox.pack_end(self._btn_fold,   False, False, 0)
+
         if on_click:
             hint = Gtk.Label()
             hint.set_markup('<span font_desc="Monospace 7" foreground="#446655">▸ détails</span>')
             hint.set_halign(Gtk.Align.END)
-            hbox.pack_end(hint, False, False, 0)
+            hbox.pack_end(hint, False, False, 4)
+
+        # ── Contenu repliable ─────────────────────────────────────────────────
+        self._content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
 
         self._lbl_main = Gtk.Label()
         self._lbl_main.set_halign(Gtk.Align.START)
@@ -804,34 +1083,72 @@ class Section(Gtk.EventBox):
         self._lbl_sub.set_halign(Gtk.Align.START)
         self._lbl_sub.set_ellipsize(Pango.EllipsizeMode.END)
 
-        box.pack_start(hbox,           False, False, 0)
-        box.pack_start(self._lbl_main, False, False, 0)
-        box.pack_start(self._bar,      False, False, 0)
-        box.pack_start(self._lbl_sub,  False, False, 0)
+        self._content.pack_start(self._lbl_main, False, False, 0)
+        self._content.pack_start(self._bar,      False, False, 0)
+        self._content.pack_start(self._lbl_sub,  False, False, 0)
 
         # Sparkline simple (CPU/GPU)
         self._spark_widget = None
         if sparkline_history is not None:
             self._spark_widget = SparklineWidget(sparkline_history)
-            box.pack_start(self._spark_widget, False, False, 0)
+            self._content.pack_start(self._spark_widget, False, False, 0)
 
-        # Dual sparkline (réseau) — injectée après construction via attach_dual_spark()
+        # Dual sparkline (réseau) — injectée après construction
         self._dual_spark = None
 
-        self._extra = []; self._box = box
+        box.pack_start(hbox,          False, False, 0)
+        box.pack_start(self._content, False, False, 0)
+
+        self._extra = []
+        self._box   = self._content   # add_row cible _content
         self.add(box)
 
-    def attach_dual_spark(self, dual_widget):
-        """Attache un DualSparkline sous le lbl_sub."""
-        self._dual_spark = dual_widget
-        self._box.pack_start(dual_widget, False, False, 0)
-        dual_widget.show_all()
+        # Appliquer l'état initial
+        if self._collapsed:
+            self._content.hide()
+
+    # ── Repli / dépli ─────────────────────────────────────────────────────────
+
+    def set_collapse_callback(self, cb):
+        """cb(title, collapsed) — appelé à chaque changement d'état."""
+        self._on_collapse_cb = cb
+
+    def set_resize_callback(self, cb):
+        """cb() — appelé après chaque repli/dépli pour redimensionner la fenêtre."""
+        self._on_resize_cb = cb
+
+    def _on_fold_clicked(self, btn):
+        self._collapsed = not self._collapsed
+        if self._collapsed:
+            self._content.hide()
+        else:
+            self._content.show_all()
+        self._update_fold_label()
+        if self._on_collapse_cb:
+            self._on_collapse_cb(self._title, self._collapsed)
+        # Forcer le recalcul de taille de la fenêtre parente
+        if getattr(self, '_on_resize_cb', None):
+            GLib.idle_add(self._on_resize_cb)
+
+    def _update_fold_label(self):
+        arrow = "▸" if self._collapsed else "▾"
+        self._btn_fold.set_label(arrow)
+
+    # ── Gestion des clics ─────────────────────────────────────────────────────
 
     def _handle_press(self, widget, event):
-        # Ne propager le clic au callback que si c'est le bouton gauche
-        # Le bouton droit est géré au niveau fenêtre
         if event.button == 1 and self._on_click:
-            self._on_click()
+            # Ne déclencher le popup que si le contenu est visible
+            if not self._collapsed:
+                self._on_click()
+
+    # ── API publique ──────────────────────────────────────────────────────────
+
+    def attach_dual_spark(self, dual_widget):
+        self._dual_spark = dual_widget
+        self._content.pack_start(dual_widget, False, False, 0)
+        if not self._collapsed:
+            dual_widget.show_all()
 
     def set_main(self, m): self._lbl_main.set_markup(m)
     def set_sub(self,  m): self._lbl_sub.set_markup(m)
@@ -853,11 +1170,15 @@ class Section(Gtk.EventBox):
         bar = BarWidget(color=color, height=5); bar.set_value(value)
         row.pack_start(lbl, False, False, 0)
         row.pack_start(bar, False, False, 0)
-        self._box.pack_start(row, False, False, 0)
-        self._extra.append(row); row.show_all()
+        self._content.pack_start(row, False, False, 0)
+        self._extra.append(row)
+        if not self._collapsed:
+            row.show_all()
 
     def clear_rows(self):
-        for r in self._extra: self._box.remove(r)
+        for r in self._extra:
+            if r is not self._dual_spark:
+                self._content.remove(r)
         self._extra.clear()
 
 
@@ -1006,7 +1327,10 @@ class SysMonitor(Gtk.Window):
         self._hist_rx  = deque([0.0]*60, maxlen=60)   # réseau download (bps)
         self._hist_tx  = deque([0.0]*60, maxlen=60)   # réseau upload   (bps)
 
-        # Layout
+        # Layout — conteneur racine horizontal : [panneau plein] + [barre mini]
+        self._root_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self._collapsed = False
+
         self._outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self._outer.set_margin_top(10); self._outer.set_margin_bottom(10)
         self._outer.set_margin_start(6); self._outer.set_margin_end(6)
@@ -1019,28 +1343,57 @@ class SysMonitor(Gtk.Window):
             s = Gtk.Separator(); s.set_margin_start(14); s.set_margin_end(14)
             return s
 
-        self._cpu_sec  = Section("▣", "PROCESSEUR", self._show_cpu_detail,
-                                 sparkline_history=self._hist_cpu)
-        self._gpu_sec  = Section("◈", "GPU",         self._show_gpu_detail,
-                                 sparkline_history=self._hist_gpu)
-        self._vram_sec = Section("▦", "VRAM",         self._show_vram_detail)
-        self._ram_sec  = Section("▤", "RAM",           self._show_ram_detail)
-        self._disk_sec = Section("▧", "STOCKAGE",     None)
-        self._net_sec  = Section("⇅", "RÉSEAU",        self._show_net_detail)
+        cfg = self._cfg
+        def _c(t): return is_collapsed(cfg, t)
+        def _cb(title, state): set_collapsed(cfg, title, state)
+
+        self._cpu_sec   = Section("▣", "PROCESSEUR",      self._show_cpu_detail,
+                                  sparkline_history=self._hist_cpu,
+                                  collapsed=_c("PROCESSEUR"))
+        self._gpu_sec   = Section("◈", "GPU",              self._show_gpu_detail,
+                                  sparkline_history=self._hist_gpu,
+                                  collapsed=_c("GPU"))
+        self._vram_sec  = Section("▦", "VRAM",              self._show_vram_detail,
+                                  collapsed=_c("VRAM"))
+        self._ram_sec   = Section("▤", "RAM",                self._show_ram_detail,
+                                  collapsed=_c("RAM"))
+        self._disk_sec  = Section("▧", "STOCKAGE",          None,
+                                  collapsed=_c("STOCKAGE"))
+        self._net_sec   = Section("⇅", "RÉSEAU",             self._show_net_detail,
+                                  collapsed=_c("RÉSEAU"))
+        self._smart_sec = Section("♥", "SMART",              self._show_smart_detail,
+                                  collapsed=_c("SMART"))
+        self._proc_sec  = Section("⚡", "PROCESSUS TOP CPU",  self._show_proc_detail,
+                                  collapsed=_c("PROCESSUS TOP CPU"))
+
+        for sec in (self._cpu_sec, self._gpu_sec, self._vram_sec, self._ram_sec,
+                    self._disk_sec, self._net_sec, self._smart_sec, self._proc_sec):
+            sec.set_collapse_callback(_cb)
+            sec.set_resize_callback(self._relayout)
 
         # DualSparkline réseau — attachée après construction
         self._dual_spark_widget = DualSparkline(self._hist_rx, self._hist_tx)
         self._net_sec.attach_dual_spark(self._dual_spark_widget)
-
-        for w in (self._cpu_sec,  sep(),
-                  self._gpu_sec,  sep(),
-                  self._vram_sec, sep(),
-                  self._ram_sec,  sep(),
-                  self._disk_sec, sep(),
-                  self._net_sec):
+        for w in (self._cpu_sec,   sep(),
+                  self._gpu_sec,   sep(),
+                  self._vram_sec,  sep(),
+                  self._ram_sec,   sep(),
+                  self._disk_sec,  sep(),
+                  self._net_sec,   sep(),
+                  self._smart_sec, sep(),
+                  self._proc_sec):
             self._outer.pack_start(w, False, False, 0)
 
-        self.add(self._outer)
+        # Barre mini (mode replié) — dessinée via DrawingArea
+        self._mini_bar = MiniBar(self._hist_cpu, self._hist_rx, self._hist_tx)
+        self._mini_bar.set_no_show_all(True)
+        self._mini_bar.hide()
+        self._mini_bar.connect("button-press-event",
+                               lambda *a: self._toggle_collapse())
+
+        self._root_box.pack_start(self._outer,   True,  True,  0)
+        self._root_box.pack_start(self._mini_bar, False, False, 0)
+        self.add(self._root_box)
 
         # Position initiale
         monitor = screen.get_monitor_geometry(0)
@@ -1059,10 +1412,14 @@ class SysMonitor(Gtk.Window):
         # Caches
         psutil.cpu_percent(interval=None)
         psutil.cpu_percent(percpu=True, interval=None)
-        self._gpu_cache  = None
-        self._gpu_tick   = 0
-        self._disk_cache = []
-        self._disk_tick  = 0
+        self._gpu_cache   = None
+        self._gpu_tick    = 0
+        self._disk_cache  = []
+        self._disk_tick   = 0
+        self._smart_cache = []          # résultats SMART (rafraîchi toutes les 60 s)
+        self._smart_tick  = 0
+        self._proc_cache  = []          # top processus CPU
+        self._alert_titles = set()      # titres d'alertes déjà affichées (anti-spam)
 
         # Réseau — compteurs de référence
         _boot = psutil.net_io_counters(pernic=True)
@@ -1094,15 +1451,24 @@ class SysMonitor(Gtk.Window):
                        'letter_spacing="4000">◈ SYSMONITOR</span>'.format(hx(ACCENT)))
         lbl.set_halign(Gtk.Align.START)
 
-        # Bouton réduire
+        # Bouton réduire (systray)
         btn_min = Gtk.Button(label="—")
         btn_min.set_relief(Gtk.ReliefStyle.NONE)
         btn_min.set_size_request(22, 18)
         btn_min.get_style_context().add_class("flat")
         btn_min.connect("clicked", lambda *a: self._toggle_visibility())
 
-        hbox.pack_start(lbl,     True,  True,  0)
-        hbox.pack_end(btn_min,   False, False, 2)
+        # Bouton replier (barre fine)
+        btn_collapse = Gtk.Button(label="▐")
+        btn_collapse.set_relief(Gtk.ReliefStyle.NONE)
+        btn_collapse.set_size_request(22, 18)
+        btn_collapse.get_style_context().add_class("flat")
+        btn_collapse.set_tooltip_text("Replier en barre compacte")
+        btn_collapse.connect("clicked", lambda *a: self._toggle_collapse())
+
+        hbox.pack_start(lbl,          True,  True,  0)
+        hbox.pack_end(btn_min,        False, False, 2)
+        hbox.pack_end(btn_collapse,   False, False, 2)
         return hbox
 
     # ── Fond ──────────────────────────────────────────────────────────────────
@@ -1148,6 +1514,22 @@ class SysMonitor(Gtk.Window):
             self.show_all()
             self.present()
             self._visible = True
+
+    def _relayout(self):
+        """Force GTK à recalculer la hauteur du panneau après repli/dépli."""
+        self.resize(310, 1)
+        return False   # ne pas répéter via idle_add
+
+    def _toggle_collapse(self):
+        self._collapsed = not self._collapsed
+        if self._collapsed:
+            self._outer.hide()
+            self._mini_bar.show()
+            self.resize(MiniBar.WIDTH, 1)
+        else:
+            self._mini_bar.hide()
+            self._outer.show_all()
+            self.resize(310, 1)
 
     # ── Menu contextuel (clic droit) ──────────────────────────────────────────
 
@@ -1246,6 +1628,15 @@ class SysMonitor(Gtk.Window):
         self._update_ram()
         self._update_disks()
         self._update_net()
+        self._update_smart()
+        self._update_procs()
+        if self._collapsed:
+            self._mini_bar.update(
+                self._hist_cpu[-1] if self._hist_cpu else 0,
+                getattr(self, '_last_ram_pct', 0),
+                self._hist_rx[-1]  if self._hist_rx  else 0,
+                self._hist_tx[-1]  if self._hist_tx  else 0,
+            )
         return True
 
     def _update_disk_temps(self):
@@ -1269,13 +1660,19 @@ class SysMonitor(Gtk.Window):
 
         t_str = "{:.0f}°C".format(temp) if temp is not None else "—"
         f_str = "{:.2f} GHz".format(freq.current/1000) if freq else ""
+        per_core  = info.get("per_core", [])
+        active_cores = sum(1 for p in per_core if p > 0)
+        total_cores  = info["cores_logical"]
         main  = self._mk("{:.0f}%".format(pct), load_color(pct), 14, True)
         main += "  " + self._mk(t_str, temp_color(temp), 10)
         if f_str: main += "  " + self._mk(f_str, TEXT_DIM, 8)
         self._cpu_sec.set_main(main)
         self._cpu_sec.set_bar(pct/100, load_color(pct))
         s = info.get("model","")
-        self._cpu_sec.set_sub(self._mk((s[:36]+"…" if len(s)>36 else s), TEXT_DIM, 7))
+        cores_active_str = "⬡ {}/{} cœurs actifs".format(active_cores, total_cores)
+        sub_model = s[:26]+"…" if len(s)>26 else s
+        sub_text  = sub_model + "  " + cores_active_str if sub_model else cores_active_str
+        self._cpu_sec.set_sub(self._mk(sub_text, TEXT_DIM, 7))
         self._cpu_sec.refresh_spark()
 
     def _show_cpu_detail(self):
@@ -1288,9 +1685,13 @@ class SysMonitor(Gtk.Window):
         v = self._v; k = self._k
         cores_str = "{} physiques / {} logiques".format(
             info["cores_physical"], info["cores_logical"])
+        per_core = info.get("per_core", [])
+        active_cores = sum(1 for p in per_core if p > 0)
         lines = ['<span font_desc="Monospace 8.5">',
                  k("Modèle")        + v(info.get("model","?"), TEXT_MAIN),
                  k("Cœurs")         + v(cores_str),
+                 k("Cœurs actifs")  + v("{} / {}".format(active_cores, info["cores_logical"]),
+                                        load_color(active_cores / max(info["cores_logical"],1) * 100)),
                  k("Fréq. courante")+ v(f_cur),
                  k("Fréq. min/max") + v("{} / {}".format(f_min, f_max), TEXT_DIM),
                  k("Charge globale")+ v("{:.1f}%".format(info["percent"]),
@@ -1410,6 +1811,7 @@ class SysMonitor(Gtk.Window):
         ram  = psutil.virtual_memory()
         swap = psutil.swap_memory()
         ratio = ram.used / ram.total
+        self._last_ram_pct = ratio * 100
         main  = self._mk("{:.0f}%".format(ratio*100), load_color(ratio*100), 14, True)
         main += "  " + self._mk("{} / {}".format(
             fmt_bytes(ram.used), fmt_bytes(ram.total)), ACCENT, 9)
@@ -1608,6 +2010,244 @@ class SysMonitor(Gtk.Window):
         self._net_sec.set_sub(self._mk(sub, TEXT_DIM, 7))
 
     def _show_net_detail(self):
+        if self._popup: self._popup.destroy()
+        info = self._net_info_cache
+        if not info:
+            return
+        v = self._v; k = self._k
+
+        try:
+            boot_c = psutil.net_io_counters()
+            sys_rx = boot_c.bytes_recv
+            sys_tx = boot_c.bytes_sent
+        except Exception:
+            sys_rx = sys_tx = 0
+
+        lines = ['<span font_desc="Monospace 8.5">',
+                 v("── Cumuls ─────────────────────────────────", TEXT_DIM),
+                 k("Session  ↓ reçu")  + v(fmt_vol(self._net_session_rx), ACCENT),
+                 k("Session  ↑ envoyé")+ v(fmt_vol(self._net_session_tx), ACCENT2),
+                 k("Boot     ↓ reçu")  + v(fmt_vol(sys_rx), TEXT_MAIN),
+                 k("Boot     ↑ envoyé")+ v(fmt_vol(sys_tx), TEXT_DIM),
+                 ""]
+
+        ifaces = info.get("interfaces", [])
+        if ifaces:
+            lines.append(v("── Interfaces ─────────────────────────────", TEXT_DIM))
+        for ifc in ifaces:
+            lines += [
+                "",
+                v("  {}".format(ifc["name"]), ACCENT3),
+                "  " + k("↓ débit")   + v(fmt_speed(ifc["rx_bps"]), ACCENT),
+                "  " + k("↑ débit")   + v(fmt_speed(ifc["tx_bps"]), ACCENT2),
+                "  " + k("↓ total")   + v(fmt_vol(ifc["rx_total"]), TEXT_MAIN),
+                "  " + k("↑ total")   + v(fmt_vol(ifc["tx_total"]), TEXT_DIM),
+                "  " + k("paquets ↓↑")+ v("{} / {}".format(
+                    ifc["rx_packets"], ifc["tx_packets"]), TEXT_DIM),
+            ]
+            if ifc["rx_errors"] or ifc["tx_errors"] or ifc["rx_drop"] or ifc["tx_drop"]:
+                lines.append("  " + k("erreurs/drops") + v(
+                    "err {}/{} drop {}/{}".format(
+                        ifc["rx_errors"], ifc["tx_errors"],
+                        ifc["rx_drop"],   ifc["tx_drop"]), WARN))
+
+        lines.append("</span>")
+        self._popup = DetailPopup("⇅ RÉSEAU — DÉTAILS", "\n".join(lines), self)
+
+    # ── SMART ─────────────────────────────────────────────────────────────────
+
+    def _update_smart(self):
+        """Rafraîchit le cache SMART toutes les 60 s en arrière-plan."""
+        self._smart_tick += 1
+        if self._smart_tick % 60 == 1 or not self._smart_cache:
+            import threading
+            def _bg():
+                data = get_smart_health()
+                self._smart_cache = data
+                GLib.idle_add(self._render_smart)
+            threading.Thread(target=_bg, daemon=True).start()
+        else:
+            self._render_smart()
+
+    def _render_smart(self):
+        data = self._smart_cache
+        if not data:
+            self._smart_sec.set_main(self._mk("smartctl indisponible", TEXT_DIM))
+            self._smart_sec.set_bar(0)
+            self._smart_sec.set_sub(self._mk("Installer smartmontools", TEXT_DIM, 7))
+            return
+
+        # Statut global = pire des disques
+        worst = "OK"
+        for d in data:
+            s = d["status"]
+            if s == "CRIT" or (s == "WARN" and worst == "OK"):
+                worst = s
+            if s == "N/A" and worst == "OK":
+                worst = "N/A"
+
+        COLOR_MAP = {"OK": ACCENT, "WARN": WARN, "CRIT": CRIT, "N/A": TEXT_DIM}
+        col = COLOR_MAP.get(worst, TEXT_DIM)
+
+        # Icône + statut global
+        icon = "✔" if worst == "OK" else ("⚠" if worst == "WARN" else ("✖" if worst == "CRIT" else "?"))
+        main = self._mk("{} {}".format(icon, worst), col, 13, True)
+        main += "  " + self._mk("{} disque(s)".format(len(data)), TEXT_DIM, 8)
+        self._smart_sec.set_main(main)
+        bar_val = 0.0 if worst == "OK" else (0.5 if worst == "WARN" else 1.0)
+        self._smart_sec.set_bar(bar_val, col)
+
+        # Résumé par disque en sous-titre
+        parts = []
+        for d in data:
+            short = d["disk"].replace("/dev/", "")
+            c = COLOR_MAP.get(d["status"], TEXT_DIM)
+            parts.append(self._mk("{} {}".format(short, d["status"]), c, 7))
+        self._smart_sec.set_sub("  ".join(parts) if parts else "")
+
+        # Popup alerte automatique si WARN ou CRIT
+        if worst in ("WARN", "CRIT"):
+            self._show_alert_popup(
+                "♥ SMART — ALERTE",
+                "Un ou plusieurs disques présentent des attributs critiques.\n"
+                "Cliquez sur la section SMART pour les détails."
+            )
+        return False  # pour GLib.idle_add
+
+    def _show_smart_detail(self):
+        if self._popup: self._popup.destroy()
+        data = self._smart_cache
+        v = self._v; k = self._k
+        lines = ['<span font_desc="Monospace 8.5">']
+        if not data:
+            lines.append(v("smartctl non disponible.", WARN))
+            lines.append(v("  → sudo apt install smartmontools", TEXT_DIM))
+        for d in data:
+            disk  = d["disk"].replace("/dev/", "")
+            ovr   = d["overall"]
+            s     = d["status"]
+            col   = ACCENT if s == "OK" else (WARN if s == "WARN" else CRIT)
+            lines.append("")
+            lines.append(v("── {} ──────────────────────────────────".format(disk), TEXT_DIM))
+            lines.append(k("Santé globale") + v(ovr, col))
+            lines.append(k("Statut")        + v(s,   col))
+            if d.get("error"):
+                lines.append(k("Erreur") + v(d["error"], WARN))
+            if d["attrs"]:
+                lines.append(k("Attributs critiques"))
+                for a in d["attrs"]:
+                    ac = ACCENT if a["raw"] == 0 else (WARN if a["raw"] <= 10 else CRIT)
+                    lines.append("  " + k(a["label"][:20], 22) + v(str(a["raw"]), ac))
+            else:
+                lines.append(v("  Aucun attribut critique détecté ✔", ACCENT))
+        lines.append("</span>")
+        self._popup = DetailPopup("♥ SMART — SANTÉ DISQUES", "\n".join(lines), self)
+
+    # ── Processus top CPU ─────────────────────────────────────────────────────
+
+    def _update_procs(self):
+        procs = get_top_cpu_procs()
+        self._proc_cache = procs
+
+        if not procs:
+            self._proc_sec.set_main(self._mk("Aucun processus", TEXT_DIM))
+            self._proc_sec.set_bar(0)
+            self._proc_sec.set_sub("")
+            return
+
+        top = procs[0]
+        col = load_color(top["cpu"])
+        main  = self._mk("{:.1f}%".format(top["cpu"]), col, 13, True)
+        main += "  " + self._mk(top["name"], TEXT_MAIN, 9)
+        self._proc_sec.set_main(main)
+        self._proc_sec.set_bar(min(top["cpu"] / 100, 1.0), col)
+
+        # 2e et 3e processus en sous-titre
+        rest = ["{}:{:.0f}%".format(p["name"][:10], p["cpu"]) for p in procs[1:3]]
+        self._proc_sec.set_sub(self._mk("  ".join(rest), TEXT_DIM, 7))
+
+        # Alerte si le top process dépasse le seuil critique
+        if top["cpu"] >= _PROC_CPU_CRIT:
+            self._show_alert_popup(
+                "⚡ PROCESSUS — ALERTE CPU",
+                "{} consomme {:.1f}% du CPU.".format(top["name"], top["cpu"])
+            )
+
+    def _show_proc_detail(self):
+        if self._popup: self._popup.destroy()
+        procs = self._proc_cache
+        v = self._v; k = self._k
+        lines = ['<span font_desc="Monospace 8.5">',
+                 v("── Top {} consommateurs CPU ──────────────".format(len(procs)), TEXT_DIM)]
+        for p in procs:
+            col  = load_color(p["cpu"])
+            cpus = "{:.1f}%".format(p["cpu"])
+            lines.append(
+                k("  PID {}".format(p["pid"]), 12) +
+                v("{:<24}".format(p["name"]), TEXT_MAIN) +
+                v(cpus, col)
+            )
+        lines.append("</span>")
+        self._popup = DetailPopup("⚡ PROCESSUS — TOP CPU", "\n".join(lines), self)
+
+    # ── Popup d'alerte automatique ────────────────────────────────────────────
+
+    def _show_alert_popup(self, title, message):
+        """Affiche une popup d'alerte une seule fois par session par titre."""
+        if title in self._alert_titles:
+            return
+        self._alert_titles.add(title)
+
+        win = Gtk.Window(type=Gtk.WindowType.POPUP)
+        win.set_keep_above(True)
+        win.set_decorated(False)
+        win.set_app_paintable(True)
+        screen = win.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual: win.set_visual(visual)
+
+        def _draw(w, cr):
+            ww = w.get_allocated_width(); wh = w.get_allocated_height()
+            cr.set_source_rgba(0.12, 0.06, 0.06, 0.95)
+            _rr(cr, 0, 0, ww, wh, 10); cr.fill()
+            cr.set_source_rgba(*CRIT, 0.6); cr.set_line_width(1)
+            _rr(cr, 0, 0, ww, wh, 10); cr.stroke()
+
+        win.connect("draw", _draw)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.set_margin_start(12); box.set_margin_end(12)
+        box.set_margin_top(8);    box.set_margin_bottom(8)
+
+        lbl_title = Gtk.Label()
+        lbl_title.set_markup(
+            '<span font_desc="Monospace Bold 9" foreground="{}">{}</span>'.format(
+                hx(CRIT), title))
+        lbl_title.set_halign(Gtk.Align.START)
+
+        lbl_msg = Gtk.Label()
+        lbl_msg.set_markup(
+            '<span font_desc="Monospace 8" foreground="{}">{}</span>'.format(
+                hx(TEXT_MAIN), message))
+        lbl_msg.set_halign(Gtk.Align.START)
+        lbl_msg.set_line_wrap(True)
+
+        box.pack_start(lbl_title, False, False, 0)
+        box.pack_start(lbl_msg,   False, False, 0)
+        win.add(box)
+
+        # Position : coin inférieur droit
+        monitor = screen.get_monitor_geometry(0)
+        win.show_all()
+        ww, wh = win.get_size()
+        win.move(monitor.width - ww - 20, monitor.height - wh - 50)
+
+        def _close():
+            win.destroy()
+            return False
+
+        GLib.timeout_add_seconds(8, _close)
+
+
         if self._popup: self._popup.destroy()
         info = self._net_info_cache
         if not info:
