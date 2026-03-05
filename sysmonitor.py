@@ -1439,6 +1439,212 @@ class SysMonitor(Gtk.Window):
             enrich_disk_temps(self._disk_cache) if self._disk_cache else None
         ), daemon=True).start()
 
+    # ── Nettoyage processus IA ────────────────────────────────────────────────
+
+    # Noms de processus IA connus (correspondance exacte ou préfixe)
+    _AI_PROC_NAMES = {
+        "llama-server", "llama-cli", "llama", "llama.cpp",
+        "ollama", "ollama_llama_server", "ollama_llama",
+    }
+    # Fragments de ligne de commande pour processus Python IA
+    _AI_CMDLINE_FRAGMENTS = (
+        "comfyui", "comfy/main.py", "comfy\\main.py",
+        "automatic1111", "webui.py", "a1111",
+        "stable-diffusion-webui", "invokeai", "invoke.py",
+        "diffusers", "llama_cpp", "llama-cpp-python",
+        "text-generation-webui", "koboldcpp", "lm_studio",
+    )
+
+    def _find_ai_processes(self):
+        """Retourne la liste des processus IA actifs : [{"pid", "name", "cmd"}]."""
+        found = []
+        seen  = set()
+        for p in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                pid  = p.info["pid"]
+                name = (p.info["name"] or "").lower()
+                cmd  = " ".join(p.info["cmdline"] or []).lower()
+
+                if pid in seen:
+                    continue
+
+                # Correspondance par nom de processus
+                matched = name in self._AI_PROC_NAMES
+                # Correspondance par ligne de commande (Python, etc.)
+                if not matched:
+                    matched = any(frag in cmd for frag in self._AI_CMDLINE_FRAGMENTS)
+
+                if matched:
+                    seen.add(pid)
+                    # Nom court lisible pour l'affichage
+                    display = p.info["name"] or name
+                    # Pour les processus python, extraire le script
+                    if "python" in name:
+                        for frag in self._AI_CMDLINE_FRAGMENTS:
+                            if frag in cmd:
+                                display = frag.split("/")[-1].split("\\")[-1]
+                                break
+                    found.append({"pid": pid, "name": display, "cmd": cmd[:60]})
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        return found
+
+    def _show_kill_ai_popup(self, *args):
+        """Affiche une popup de confirmation avant de tuer les processus IA."""
+        import signal as _signal
+
+        if self._popup:
+            self._popup.destroy()
+
+        procs = self._find_ai_processes()
+        v = self._v; k = self._k
+
+        win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        win.set_decorated(False)
+        win.set_keep_above(True)
+        win.set_app_paintable(True)
+        screen = win.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual:
+            win.set_visual(visual)
+
+        def _draw_bg(w, cr):
+            ww = w.get_allocated_width(); wh = w.get_allocated_height()
+            cr.set_source_rgba(0.06, 0.09, 0.08, 0.96)
+            _rr(cr, 0, 0, ww, wh, 10); cr.fill()
+            cr.set_source_rgba(*ACCENT, 0.35); cr.set_line_width(1)
+            _rr(cr, 0, 0, ww, wh, 10); cr.stroke()
+        win.connect("draw", _draw_bg)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        outer.set_margin_start(16); outer.set_margin_end(16)
+        outer.set_margin_top(12);   outer.set_margin_bottom(12)
+
+        # Titre
+        lbl_title = Gtk.Label()
+        lbl_title.set_markup(
+            '<span font_desc="Monospace Bold 9" foreground="{}">🧹 LIBÉRER MÉMOIRE IA</span>'.format(hx(ACCENT)))
+        lbl_title.set_halign(Gtk.Align.START)
+        outer.pack_start(lbl_title, False, False, 0)
+        outer.pack_start(Gtk.Separator(), False, False, 0)
+
+        if not procs:
+            lbl_none = Gtk.Label()
+            lbl_none.set_markup(
+                '<span font_desc="Monospace 8.5" foreground="{}">Aucun processus IA détecté.</span>'.format(hx(TEXT_DIM)))
+            lbl_none.set_halign(Gtk.Align.START)
+            outer.pack_start(lbl_none, False, False, 0)
+
+            btn_close = Gtk.Button(label="Fermer")
+            btn_close.set_relief(Gtk.ReliefStyle.NONE)
+            btn_close.connect("clicked", lambda *a: win.destroy())
+            outer.pack_start(btn_close, False, False, 4)
+        else:
+            lbl_intro = Gtk.Label()
+            lbl_intro.set_markup(
+                '<span font_desc="Monospace 8" foreground="{}">Processus IA détectés :</span>'.format(hx(TEXT_DIM)))
+            lbl_intro.set_halign(Gtk.Align.START)
+            outer.pack_start(lbl_intro, False, False, 0)
+
+            for p in procs:
+                lbl_p = Gtk.Label()
+                lbl_p.set_markup(
+                    '<span font_desc="Monospace 8.5">'
+                    '<span foreground="{}">{:<22}</span>'
+                    '<span foreground="{}">PID {}</span>'
+                    '</span>'.format(hx(TEXT_MAIN), p["name"][:22], hx(TEXT_DIM), p["pid"]))
+                lbl_p.set_halign(Gtk.Align.START)
+                outer.pack_start(lbl_p, False, False, 0)
+
+            lbl_warn = Gtk.Label()
+            lbl_warn.set_markup(
+                '<span font_desc="Monospace 7.5" foreground="{}">⚠ Ces processus seront arrêtés (SIGTERM).</span>'.format(hx(WARN)))
+            lbl_warn.set_halign(Gtk.Align.START)
+            outer.pack_start(lbl_warn, False, False, 2)
+
+            # Boutons Confirmer / Annuler
+            btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+
+            btn_ok = Gtk.Button(label="✓ Confirmer")
+            btn_ok.set_relief(Gtk.ReliefStyle.NONE)
+
+            btn_cancel = Gtk.Button(label="✕ Annuler")
+            btn_cancel.set_relief(Gtk.ReliefStyle.NONE)
+
+            def _do_kill(*a):
+                killed = []
+                failed = []
+                for proc_info in procs:
+                    try:
+                        p_obj = psutil.Process(proc_info["pid"])
+                        p_obj.terminate()   # SIGTERM — arrêt propre
+                        killed.append(proc_info["name"])
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        failed.append(proc_info["name"])
+                win.destroy()
+                self._show_kill_result(killed, failed)
+
+            btn_ok.connect("clicked", _do_kill)
+            btn_cancel.connect("clicked", lambda *a: win.destroy())
+
+            btn_box.pack_start(btn_ok,     True, True, 0)
+            btn_box.pack_start(btn_cancel, True, True, 0)
+            outer.pack_start(btn_box, False, False, 4)
+
+        win.add(outer)
+        win.show_all()
+
+        # Positionner à gauche du panneau principal
+        px, py = self.get_window().get_origin()[1:]
+        win.show_all()
+        ww, wh = win.get_size()
+        win.move(max(0, px - ww - 10), py + 40)
+
+    def _show_kill_result(self, killed, failed):
+        """Affiche un bref résumé après l'arrêt des processus."""
+        result_win = Gtk.Window(type=Gtk.WindowType.POPUP)
+        result_win.set_decorated(False)
+        result_win.set_keep_above(True)
+        result_win.set_app_paintable(True)
+        screen = result_win.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual:
+            result_win.set_visual(visual)
+
+        def _draw(w, cr):
+            ww = w.get_allocated_width(); wh = w.get_allocated_height()
+            cr.set_source_rgba(0.06, 0.10, 0.07, 0.96)
+            _rr(cr, 0, 0, ww, wh, 10); cr.fill()
+            cr.set_source_rgba(*ACCENT, 0.4); cr.set_line_width(1)
+            _rr(cr, 0, 0, ww, wh, 10); cr.stroke()
+        result_win.connect("draw", _draw)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.set_margin_start(14); box.set_margin_end(14)
+        box.set_margin_top(8);    box.set_margin_bottom(8)
+
+        lbl = Gtk.Label()
+        lines = ['<span font_desc="Monospace 8.5">']
+        if killed:
+            lines.append('<span foreground="{}">✔ Arrêtés : {}</span>'.format(
+                hx(ACCENT), ", ".join(killed)))
+        if failed:
+            lines.append('<span foreground="{}">✗ Échec   : {}</span>'.format(
+                hx(WARN), ", ".join(failed)))
+        if not killed and not failed:
+            lines.append('<span foreground="{}">Aucun processus à arrêter.</span>'.format(hx(TEXT_DIM)))
+        lines.append("</span>")
+        lbl.set_markup("\n".join(lines))
+        lbl.set_halign(Gtk.Align.START)
+        box.pack_start(lbl, False, False, 0)
+        result_win.add(box)
+
+        monitor = screen.get_monitor_geometry(0)
+        result_win.show_all()
+        ww, wh = result_win.get_size()
+        result_win.move(monitor.width - ww - 20, monitor.height - wh - 50)
+        GLib.timeout_add_seconds(5, lambda: result_win.destroy() or False)
+
     # ── Barre de titre ────────────────────────────────────────────────────────
 
     def _build_titlebar(self):
@@ -1466,9 +1672,18 @@ class SysMonitor(Gtk.Window):
         btn_collapse.set_tooltip_text("Replier en barre compacte")
         btn_collapse.connect("clicked", lambda *a: self._toggle_collapse())
 
+        # Bouton libérer mémoire IA
+        btn_kill_ai = Gtk.Button(label="🧹")
+        btn_kill_ai.set_relief(Gtk.ReliefStyle.NONE)
+        btn_kill_ai.set_size_request(22, 18)
+        btn_kill_ai.get_style_context().add_class("flat")
+        btn_kill_ai.set_tooltip_text("Libérer VRAM/RAM — arrêter les processus IA")
+        btn_kill_ai.connect("clicked", self._show_kill_ai_popup)
+
         hbox.pack_start(lbl,          True,  True,  0)
         hbox.pack_end(btn_min,        False, False, 2)
         hbox.pack_end(btn_collapse,   False, False, 2)
+        hbox.pack_end(btn_kill_ai,    False, False, 2)
         return hbox
 
     # ── Fond ──────────────────────────────────────────────────────────────────

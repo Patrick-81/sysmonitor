@@ -26,6 +26,7 @@
 ### Autres fonctionnalités
 
 - **Sections repliables** — chaque section se plie/déplie individuellement via `▾/▸`, état persisté entre les sessions
+- **Bouton 🧹** — libère la VRAM/RAM en arrêtant proprement les processus IA détectés (LLM, diffusion…)
 - **Sparklines** — graphes d'historique 60 secondes pour CPU, GPU et réseau (double courbe ↓/↑)
 - **4 thèmes couleur** — Vert menthe, Bleu azur, Ambre doré, Violet néon
 - **Semi-transparent** — fond sombre avec alpha configurable, bordure lumineuse
@@ -151,6 +152,7 @@ python3 sysmonitor.py &
 | Action | Effet |
 |--------|-------|
 | **Bouton `▾/▸`** (en-tête de section) | Replier / déplier le contenu de la section (état mémorisé) |
+| **Bouton `🧹`** (barre de titre) | Détecter et arrêter les processus IA (LLM, diffusion…) pour libérer VRAM/RAM |
 | **Bouton `▐`** (barre de titre) | Replier le widget en barre compacte verticale |
 | **Clic sur la barre compacte** | Déplier le panneau complet |
 | **Bouton `—`** (barre de titre) | Réduire le widget dans la barre de notification |
@@ -171,6 +173,7 @@ python3 sysmonitor.py &
 - **Thème couleur** — 4 thèmes disponibles, changement immédiat et sauvegardé
 - **Redémarrer** — relance le processus (utile après une mise à jour)
 - **À propos** — version et raccourcis
+- **🧹 (bouton titre)** — détecte et arrête proprement les processus IA pour libérer VRAM/RAM
 - **Quitter** — ferme le widget
 
 ---

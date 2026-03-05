@@ -1,5 +1,17 @@
 # Changelog
 
+## [4.2.0] — 2025
+
+### Ajouté
+- **Bouton 🧹 "Libérer mémoire IA"** dans la barre de titre
+  - Détecte automatiquement les processus IA actifs par nom de processus (`llama-server`, `llama-cli`, `ollama`, `ollama_llama_server`…) et par ligne de commande Python (`comfyui`, `webui.py`, `stable-diffusion-webui`, `invokeai`, `koboldcpp`, `text-generation-webui`, `llama_cpp`…)
+  - Popup de confirmation listant chaque processus détecté (nom + PID) avec boutons `✓ Confirmer` / `✕ Annuler`
+  - Arrêt propre via **SIGTERM** (laisse aux processus le temps de libérer VRAM/RAM)
+  - Résumé affiché 5 secondes (coin inférieur droit) indiquant les processus arrêtés ou en échec
+  - La popup s'affiche à **gauche du panneau principal** (avec repli automatique si le panneau est en bord d'écran)
+
+---
+
 ## [4.1.0] — 2025
 
 ### Ajouté
